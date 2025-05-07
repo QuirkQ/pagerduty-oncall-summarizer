@@ -11,6 +11,7 @@ class PagerDutyOnCallTime
   API_BASE      = 'https://api.pagerduty.com'.freeze
   API_VERSION   = 'application/vnd.pagerduty+json;version=2'.freeze
   DEFAULT_LIMIT = 100
+  MAX_TIME_SPAN = 60 * 60 * 24 * 90 # 90 days in seconds (PagerDuty API limit)
 
   def initialize(token:, time_zone: nil)
     @headers = {
@@ -42,15 +43,69 @@ class PagerDutyOnCallTime
     policies.each { |p| puts "#{p['id']} — #{p['summary']}" }
   end
 
-  # Fetch oncalls with proper pagination and total count
+  def to_time(date_or_time)
+    return date_or_time if date_or_time.is_a?(Time)
+    begin
+      Time.parse(date_or_time.to_s)
+    rescue ArgumentError => e
+      warn "❌ Error parsing date: #{date_or_time} - #{e.message}"
+      exit 1
+    end
+  end
+
+  def exceeds_max_time_span?(since, until_time)
+    return false unless since && until_time
+    
+    start_time = to_time(since)
+    end_time = to_time(until_time)
+    
+    (end_time - start_time) > MAX_TIME_SPAN
+  end
+
   def fetch_oncalls(since: nil, until_time: nil, user_ids: [], policy_ids: [], earliest: false)
+    return fetch_oncalls_for_period(since, until_time, user_ids, policy_ids, earliest) unless exceeds_max_time_span?(since, until_time)
+    
+    all_oncalls = []
+    current_start = since
+    
+    end_time = to_time(until_time)
+    
+    while true
+      start_time = to_time(current_start)
+      
+      break if start_time >= end_time
+      
+      chunk_end = [start_time + MAX_TIME_SPAN, end_time].min
+      
+      start_str = start_time.respond_to?(:iso8601) ? start_time.iso8601 : start_time.to_s
+      end_str = chunk_end.respond_to?(:iso8601) ? chunk_end.iso8601 : chunk_end.to_s
+      
+      chunk_oncalls = fetch_oncalls_for_period(current_start, chunk_end, user_ids, policy_ids, earliest)
+      all_oncalls.concat(chunk_oncalls)
+      
+      current_start = chunk_end
+    end
+    
+    all_oncalls
+  end
+  
+  def fetch_oncalls_for_period(since, until_time, user_ids, policy_ids, earliest)
     params = {
       limit:    DEFAULT_LIMIT,
       total:    true,
       earliest: earliest
     }
-    params[:since]     = since.iso8601      if since
-    params[:until]     = until_time.iso8601 if until_time
+    
+    if since
+      start_time = to_time(since)
+      params[:since] = start_time.iso8601
+    end
+    
+    if until_time
+      end_time = to_time(until_time)
+      params[:until] = end_time.iso8601
+    end
+    
     params[:time_zone] = @time_zone         if @time_zone
     params[:user_ids]               = user_ids   if user_ids.any?
     params[:escalation_policy_ids] = policy_ids if policy_ids.any?
